@@ -1,0 +1,6 @@
+google-api-python-client
+youtube_transcript_api
+googletrans==4.0.0rc1
+yt_dlp
+SpeechRecognition
+nltk

@@ -1,0 +1,30 @@
+{
+  "general_0_0": {
+    "source": "The weather forecast predicts heavy rainfall throughout the weekend.",
+    "domain": "general"
+  },
+  "general_0_1": {
+    "source": "The new restaurant downtown offers a fusion of Mediterranean and Asian cuisine.",
+    "domain": "general"
+  },
+  "general_0_2": {
+    "source": "Public transportation services will be limited during the upcoming holiday.",
+    "domain": "general"
+  },
+  "general_0_3": {
+    "source": "The local community center is hosting a workshop on sustainable gardening next month.",
+    "domain": "general"
+  },
+  "general_0_4": {
+    "source": "Scientists have discovered a new species of butterfly in the Amazon rainforest.",
+    "domain": "general"
+  },
+  "general_0_5": {
+    "source": "The annual music festival will feature both international and local artists this year.",
+    "domain": "general"
+  },
+  "general_0_6": {
+    "source": "Regular exercise and a balanced diet contribute to overall health and wellbeing.",
+    "domain": "general"
+  }
+}

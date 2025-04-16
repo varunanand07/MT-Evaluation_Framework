@@ -1,0 +1,30 @@
+{
+  "legal_1_0": {
+    "source": "The parties hereby agree to the terms and conditions set forth in this binding contract.",
+    "domain": "legal"
+  },
+  "legal_1_1": {
+    "source": "The defendant was found guilty of all charges and sentenced to five years of incarceration.",
+    "domain": "legal"
+  },
+  "legal_1_2": {
+    "source": "According to Section 8.3 of the agreement, the tenant must provide 30 days' notice before vacating.",
+    "domain": "legal"
+  },
+  "legal_1_3": {
+    "source": "The plaintiff seeks damages for breach of contract and emotional distress.",
+    "domain": "legal"
+  },
+  "legal_1_4": {
+    "source": "In accordance with the tax code, all income from foreign sources must be reported on Schedule B.",
+    "domain": "legal"
+  },
+  "legal_1_5": {
+    "source": "The court granted a temporary restraining order pending the outcome of the hearing.",
+    "domain": "legal"
+  },
+  "legal_1_6": {
+    "source": "Intellectual property rights shall remain with the creator unless explicitly transferred in writing.",
+    "domain": "legal"
+  }
+}

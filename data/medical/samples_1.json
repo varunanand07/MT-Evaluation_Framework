@@ -1,0 +1,37 @@
+{
+  "medical_1_0": {
+    "source": "The patient presented with symptoms of acute respiratory distress and was admitted for further evaluation.",
+    "domain": "medical",
+    "reference": "El paciente presentó síntomas de dificultad respiratoria aguda y fue ingresado para una evaluación adicional."
+  },
+  "medical_1_1": {
+    "source": "MRI results showed a small lesion in the parietal lobe requiring follow-up with a neurologist.",
+    "domain": "medical",
+    "reference": "Los resultados de la resonancia magnética mostraron una pequeña lesión en el lóbulo parietal que requiere seguimiento con un neurólogo."
+  },
+  "medical_1_2": {
+    "source": "The recommended treatment includes 500mg of amoxicillin taken orally three times per day for 10 days.",
+    "domain": "medical",
+    "reference": "El tratamiento recomendado incluye 500 mg de amoxicilina tomados por vía oral tres veces al día durante 10 días."
+  },
+  "medical_1_3": {
+    "source": "Patients with type 2 diabetes should monitor their blood glucose levels regularly.",
+    "domain": "medical",
+    "reference": "Los pacientes con diabetes tipo 2 deben controlar regularmente sus niveles de glucosa en sangre."
+  },
+  "medical_1_4": {
+    "source": "The surgical team performed a laparoscopic cholecystectomy with minimal complications.",
+    "domain": "medical",
+    "reference": "El equipo quirúrgico realizó una colecistectomía laparoscópica con complicaciones mínimas."
+  },
+  "medical_1_5": {
+    "source": "Elevated troponin levels may indicate myocardial infarction or other cardiac conditions.",
+    "domain": "medical",
+    "reference": "Los niveles elevados de troponina pueden indicar un infarto de miocardio u otras afecciones cardíacas."
+  },
+  "medical_1_6": {
+    "source": "Symptoms of hypertension include headaches, shortness of breath, and nosebleeds.",
+    "domain": "medical",
+    "reference": "Los síntomas de hipertensión incluyen dolores de cabeza, dificultad para respirar y sangrado nasal."
+  }
+}

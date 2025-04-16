@@ -1,0 +1,26 @@
+{
+  "technical_2_0": {
+    "source": "The API uses RESTful architecture to enable seamless integration with third-party applications.",
+    "domain": "technical"
+  },
+  "technical_2_1": {
+    "source": "A buffer overflow vulnerability was detected in the legacy code and patched in version 3.2.1.",
+    "domain": "technical"
+  },
+  "technical_2_2": {
+    "source": "The system architecture utilizes microservices deployed in containerized environments.",
+    "domain": "technical"
+  },
+  "technical_2_3": {
+    "source": "Python's list comprehension feature enables concise and readable code for transforming collections.",
+    "domain": "technical"
+  },
+  "technical_2_4": {
+    "source": "The database query performance was optimized by adding proper indexes on frequently accessed columns.",
+    "domain": "technical"
+  },
+  "technical_2_5": {
+    "source": "The frontend is built with React using functional components and hooks for state management.",
+    "domain": "technical"
+  }
+}
