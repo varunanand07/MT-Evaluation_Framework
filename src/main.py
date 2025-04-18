@@ -29,6 +29,9 @@ import time
 import sacrebleu
 import traceback
 from typing import List, Dict, Any, Optional, Tuple
+from fuzzywuzzy import fuzz
+from statistics import mean
+from tabulate import tabulate
 
 YOUTUBE_API_KEY = "YOUR_YOUTUBE_API_KEY_HERE"  
 
@@ -330,7 +333,7 @@ class MTEvaluator:
             print(f"Error calculating ROUGE: {e}")
             return 0.0
     
-    def run_evaluation(self, translation_systems, evaluation_metrics, target_language="es", num_samples=10, reference_system=None, custom_dataset=None):
+    def run_evaluation(self, translation_systems, evaluation_metrics, target_language="es", num_samples=150, reference_system=None, custom_dataset=None):
         """
         Run a comprehensive evaluation of multiple translation systems.
         
@@ -357,23 +360,26 @@ class MTEvaluator:
         
         if custom_dataset is not None:
             print(f"Using provided custom dataset with {len(custom_dataset)} samples")
-            data = []
-            for sample_id, sample in custom_dataset.items():
-                data.append({
-                    "video_id": sample_id,
-                    "captions": sample.get("source", ""),
-                    "domain": sample.get("domain", "general")
-                })
+            data = custom_dataset
         else:
-            data = self.load_data()
+            data = self.load_dataset(num_samples=num_samples)
         
-        if num_samples is not None and len(data) > num_samples:
-            import random
-            data = random.sample(data, num_samples)
+        data_list = []
+        for sample_id, sample in data.items():
+            data_list.append({
+                "video_id": sample_id,
+                "captions": sample.get("source", ""),
+                "domain": sample.get("domain", "general")
+            })
+        
+        print(f"Processing {len(data_list)} samples for evaluation")
         
         results = []
         
-        for video in tqdm(data, desc="Processing samples"):
+        for video in tqdm(data_list, desc="Processing samples"):
+            import matplotlib.pyplot as plt
+            plt.close('all')
+            
             video_id = video.get("video_id", str(uuid.uuid4()))
             
             source_text = video.get("captions", "")
@@ -581,51 +587,90 @@ class MTEvaluator:
 
     def add_back_translation_evaluation(self):
         """
-        Implement back-translation to evaluate without Spanish knowledge.
-        Translates Spanish results back to English for comparison with original.
+        Improved back-translation with consistent preprocessing and controls.
         """
         translations_path = os.path.join(self.results_dir, "translations", "all_translations.json")
         with open(translations_path, 'r') as f:
             translations = json.load(f)
-        
+            
         results = []
         
         for video_id, data in tqdm(translations.items(), desc="Back-translating"):
             source_text = data['source']
+            source_text_processed = self._preprocess_for_back_translation(source_text)
+            
             data['back_translations'] = {}
             
-            reference_spanish = data['reference']
-            reference_back = self.translate_deepl(reference_spanish, "en")
-            data['reference_back'] = reference_back
-            
             for system, spanish_text in data['translations'].items():
-                back_translation = self.translate_deepl(spanish_text, "en")
+                if system == self.reference_system and not getattr(self, 'evaluate_reference', False):
+                    continue
+                    
+                spanish_text_processed = self._preprocess_for_back_translation(spanish_text)
+                
+                back_translation = self.translate_deepl(spanish_text_processed, "en")
+                
+                back_translation_processed = self._preprocess_for_back_translation(back_translation)
+                
                 data['back_translations'][system] = back_translation
                 
-                bleu = self.calculate_bleu(source_text, back_translation)
-                meteor = self.calculate_meteor(source_text, back_translation)
-                chrf = self.calculate_chrf(source_text, back_translation)
+                back_bleu = self.calculate_bleu(source_text_processed, back_translation_processed)
+                back_meteor = self.calculate_meteor(source_text_processed, back_translation_processed)
+                back_chrf = self.calculate_chrf(source_text_processed, back_translation_processed)
+                
+                if back_bleu > 0.98 and video_id != system:
+                    print(f"Warning: Near-perfect back-translation for {video_id}, {system}")
+                    print(f"Source: {source_text[:100]}...")
+                    print(f"Back-translation: {back_translation[:100]}...")
                 
                 results.append({
                     "video_id": video_id,
                     "system": system,
-                    "back_bleu": bleu,
-                    "back_meteor": meteor,
-                    "back_chrf": chrf
+                    "back_bleu": back_bleu,
+                    "back_meteor": back_meteor,
+                    "back_chrf": back_chrf,
                 })
         
-        os.makedirs(os.path.join(self.results_dir, "translations"), exist_ok=True)
+        results_df = pd.DataFrame(results)
+        back_path = os.path.join(self.results_dir, "back_translation_evaluation.csv")
+        results_df.to_csv(back_path, index=False)
+        
         back_translations_path = os.path.join(self.results_dir, "translations", "back_translations.json")
         with open(back_translations_path, 'w') as f:
             json.dump(translations, f, indent=2)
         
-        results_df = pd.DataFrame(results)
-        back_eval_path = os.path.join(self.results_dir, "back_translation_evaluation.csv")
-        results_df.to_csv(back_eval_path, index=False)
-        
-        self.generate_back_translation_html(translations)
+        self._generate_back_translation_plot(results_df)
         
         return results_df
+
+    def _preprocess_for_back_translation(self, text):
+        """
+        Apply consistent preprocessing for back-translation comparison.
+        """
+        text = text.lower()
+        
+        text = ' '.join(text.split())
+        
+        import string
+        translator = str.maketrans('', '', string.punctuation)
+        text = text.translate(translator)
+        
+        return text
+
+    def _generate_back_translation_plot(self, back_df):
+        """Generate visualization of back-translation quality."""
+        plt.figure(figsize=(12, 6))
+        
+        system_scores = back_df.groupby('system')[['back_bleu', 'back_meteor', 'back_chrf']].mean()
+        
+        system_scores.plot(kind='bar', figsize=(10, 6))
+        plt.title('Back-Translation Quality by System')
+        plt.ylabel('Score (0-1)')
+        plt.xlabel('Translation System')
+        plt.legend(title='Metric')
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(self.results_dir, "figures", "back_translation_quality.png"))
+        plt.close()
 
     def generate_back_translation_html(self, translations):
         """Generate HTML with side-by-side comparison of original and back-translations."""
@@ -687,205 +732,106 @@ class MTEvaluator:
 
     def analyze_sentiment_preservation(self):
         """
-        Analyze how well different translation systems preserve sentiment.
+        Improved sentiment analysis that compares sentiment on a scale rather than binary match.
         """
-        from transformers import pipeline
-        from nltk.tokenize import sent_tokenize
-        
-        print("Loading sentiment analysis models...")
-        sentiment_en = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-        sentiment_es = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
-        
         translations_path = os.path.join(self.results_dir, "translations", "all_translations.json")
         with open(translations_path, 'r') as f:
             translations = json.load(f)
         
         results = []
         
-        def get_safe_sentiment(text, sentiment_model):
-            if len(text) > 500:
-                text = text[:500]
-            
-            try:
-                return sentiment_model(text)[0]
-            except Exception as e:
-                print(f"Error processing text: {str(e)}")
-                return {"label": "NEUTRAL", "score": 0.5}
-        
         for video_id, data in tqdm(translations.items(), desc="Analyzing sentiment"):
             source_text = data['source']
-            source_sentences = sent_tokenize(source_text)[:5]
+            source_sentences = self.split_into_sentences(source_text)
             
-            data['sentiment_analysis'] = {
-                'source_sentences': [],
-                'reference': {},
-                'translations': {}
-            }
-            
-            for i, sentence in enumerate(source_sentences):
-                if len(sentence.strip()) < 10:
+            for system, translation in data['translations'].items():
+                translated_sentences = self.split_into_sentences(translation)
+                
+                max_sentences = min(len(source_sentences), len(translated_sentences))
+                if max_sentences == 0:
                     continue
                     
-                sentiment = get_safe_sentiment(sentence, sentiment_en)
-                data['sentiment_analysis']['source_sentences'].append({
-                    'sentence': sentence,
-                    'sentiment': sentiment['label'],
-                    'score': sentiment['score']
-                })
-                
-                reference_text = data['reference']
-                ref_sentences = sent_tokenize(reference_text)
-                
-                if i < len(ref_sentences):
-                    ref_sentiment = get_safe_sentiment(ref_sentences[i], sentiment_es)
-                    ref_analysis = {
-                        'sentence': ref_sentences[i],
-                        'sentiment': ref_sentiment['label'],
-                        'score': ref_sentiment['score'],
-                        'sentiment_match': sentiment['label'] == ref_sentiment['label']
-                    }
-                    data['sentiment_analysis']['reference'][i] = ref_analysis
-                
-                for system, translation in data['translations'].items():
-                    if system not in data['sentiment_analysis']['translations']:
-                        data['sentiment_analysis']['translations'][system] = {}
+                for i in range(max_sentences):
+                    source_sentiment = self.analyze_sentiment(source_sentences[i], 'en')
+                    translation_sentiment = self.analyze_sentiment(translated_sentences[i], 'es')
                     
-                    sys_sentences = sent_tokenize(translation)
-                    if i < len(sys_sentences):
-                        sys_sentiment = get_safe_sentiment(sys_sentences[i], sentiment_es)
-                        sys_analysis = {
-                            'sentence': sys_sentences[i],
-                            'sentiment': sys_sentiment['label'],
-                            'score': sys_sentiment['score'],
-                            'sentiment_match': sentiment['label'] == sys_sentiment['label']
-                        }
-                        data['sentiment_analysis']['translations'][system][i] = sys_analysis
-                        
-                        results.append({
-                            'video_id': video_id,
-                            'sentence_id': i,
-                            'system': system,
-                            'source_sentiment': sentiment['label'],
-                            'translation_sentiment': sys_sentiment['label'],
-                            'sentiment_preserved': sentiment['label'] == sys_sentiment['label']
-                        })
+                    sentiment_similarity = self._calculate_sentiment_similarity(
+                        source_sentiment, translation_sentiment)
+                    
+                    sentiment_preserved = self._is_sentiment_preserved(
+                        source_sentiment, translation_sentiment)
+                    
+                    results.append({
+                        "video_id": video_id,
+                        "sentence_id": i,
+                        "system": system,
+                        "source_sentiment": source_sentiment,
+                        "translation_sentiment": translation_sentiment,
+                        "sentiment_preserved": sentiment_preserved,
+                        "sentiment_similarity": sentiment_similarity
+                    })
         
         results_df = pd.DataFrame(results)
         sentiment_path = os.path.join(self.results_dir, "sentiment_analysis.csv")
         results_df.to_csv(sentiment_path, index=False)
         
-        plt.figure(figsize=(10, 6))
-        preservation_counts = results_df.groupby(['system', 'sentiment_preserved']).size().unstack()
-        preservation_counts.plot(kind='bar', stacked=True)
-        plt.title('Sentiment Preservation by Translation System')
-        plt.xlabel('Translation System')
-        plt.ylabel('Count')
-        plt.savefig(os.path.join(self.results_dir, "figures", "sentiment_preservation.png"))
-        
-        os.makedirs(os.path.join(self.results_dir, "translations"), exist_ok=True)
-        sentiment_translations_path = os.path.join(self.results_dir, "translations", "sentiment_translations.json")
-        with open(sentiment_translations_path, 'w') as f:
-            json.dump(translations, f, indent=2)
-        
-        self.generate_sentiment_html(translations)
+        self._generate_sentiment_similarity_plot(results_df)
         
         return results_df
 
-    def generate_sentiment_html(self, translations):
-        """Generate HTML report for sentiment analysis."""
-        html = [
-            "<!DOCTYPE html>",
-            "<html>",
-            "<head>",
-            "  <title>Sentiment Analysis Comparison</title>",
-            "  <style>",
-            "    body { font-family: Arial, sans-serif; }",
-            "    table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }",
-            "    th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }",
-            "    th { background-color: #f2f2f2; }",
-            "    .sentiment-match { background-color: #d4edda; }",
-            "    .sentiment-mismatch { background-color: #f8d7da; }",
-            "    .positive { color: green; font-weight: bold; }",
-            "    .negative { color: red; font-weight: bold; }",
-            "    .neutral { color: gray; font-weight: bold; }",
-            "  </style>",
-            "</head>",
-            "<body>",
-            "  <h1>Sentiment Preservation Analysis</h1>"
-        ]
-        
-        for video_id, data in translations.items():
-            if 'sentiment_analysis' not in data:
-                continue
+    def _calculate_sentiment_similarity(self, source_sentiment, translation_sentiment):
+        """Calculate similarity between source and translation sentiment"""
+        if isinstance(translation_sentiment, str) and 'star' in translation_sentiment:
+            try:
+                stars = int(translation_sentiment.split()[0])
+                trans_score = stars / 5.0
+            except (ValueError, IndexError):
+                trans_score = 0.5
+        else:
+            trans_score = 0.5
+
+        if source_sentiment == "POSITIVE":
+            source_score = 0.75
+        elif source_sentiment == "NEGATIVE":
+            source_score = 0.25
+        else:
+            source_score = 0.5
             
-            html.append(f"  <h2>Video ID: {video_id}</h2>")
-            
-            for i, source in enumerate(data['sentiment_analysis']['source_sentences']):
-                html.append(f"  <h3>Sentence {i+1}</h3>")
-                html.append("  <table>")
-                html.append("    <tr><th>System</th><th>Text</th><th>Sentiment</th><th>Match?</th></tr>")
-                
-                sentiment_class = source['sentiment'].lower()
-                html.append("    <tr>")
-                html.append("      <td><strong>Source (English)</strong></td>")
-                html.append(f"      <td>{source['sentence']}</td>")
-                html.append(f"      <td class='{sentiment_class}'>{source['sentiment']} ({source['score']:.2f})</td>")
-                html.append("      <td>-</td>")
-                html.append("    </tr>")
-                
-                if str(i) in data['sentiment_analysis']['reference']:
-                    ref = data['sentiment_analysis']['reference'][str(i)]
-                    sentiment_class = ref['sentiment'].lower()
-                    row_class = "sentiment-match" if ref['sentiment_match'] else "sentiment-mismatch"
-                    html.append(f"    <tr class='{row_class}'>")
-                    html.append("      <td><strong>Reference</strong></td>")
-                    html.append(f"      <td>{ref['sentence']}</td>")
-                    html.append(f"      <td class='{sentiment_class}'>{ref['sentiment']} ({ref['score']:.2f})</td>")
-                    html.append(f"      <td>{'✓' if ref['sentiment_match'] else '✗'}</td>")
-                    html.append("    </tr>")
-                
-                for system, translations in data['sentiment_analysis']['translations'].items():
-                    if str(i) in translations:
-                        trans = translations[str(i)]
-                        sentiment_class = trans['sentiment'].lower()
-                        row_class = "sentiment-match" if trans['sentiment_match'] else "sentiment-mismatch"
-                        html.append(f"    <tr class='{row_class}'>")
-                        html.append(f"      <td>{system}</td>")
-                        html.append(f"      <td>{trans['sentence']}</td>")
-                        html.append(f"      <td class='{sentiment_class}'>{trans['sentiment']} ({trans['score']:.2f})</td>")
-                        html.append(f"      <td>{'✓' if trans['sentiment_match'] else '✗'}</td>")
-                        html.append("    </tr>")
-                
-                html.append("  </table>")
+        return 1.0 - abs(source_score - trans_score)
+
+    def _is_sentiment_preserved(self, source_sentiment, translation_sentiment):
+        """Legacy method for binary sentiment preservation check."""
+        positive_indicators = ["POSITIVE", "4 stars", "5 stars"]
+        negative_indicators = ["NEGATIVE", "1 stars", "2 stars"]
+        neutral_indicators = ["NEUTRAL", "3 stars"]
         
-        html.append("</body>")
-        html.append("</html>")
+        if source_sentiment in positive_indicators:
+            return translation_sentiment in positive_indicators
+        elif source_sentiment in negative_indicators:
+            return translation_sentiment in negative_indicators
+        else:
+            return translation_sentiment in neutral_indicators
+
+    def _generate_sentiment_similarity_plot(self, sentiment_df):
+        """Generate visualization of sentiment similarity scores."""
+        plt.figure(figsize=(10, 6))
         
-        html_path = os.path.join(self.results_dir, "sentiment_analysis.html")
-        with open(html_path, "w") as f:
-            f.write("\n".join(html))
+        system_scores = sentiment_df.groupby('system')['sentiment_similarity'].mean()
         
-        print(f"Sentiment analysis report generated at: {html_path}")
-        return html_path
+        system_scores.plot(kind='bar', color='skyblue')
+        plt.title('Average Sentiment Similarity by Translation System')
+        plt.ylabel('Sentiment Similarity (0-1)')
+        plt.xlabel('Translation System')
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(self.results_dir, "figures", "sentiment_similarity.png"))
+        plt.close()
 
     def analyze_entity_preservation(self):
         """
-        Analyze how well different translation systems preserve named entities.
+        Enhanced entity analysis with fuzzy matching and normalization.
         """
-        print("Loading NER models...")
-        try:
-            nlp_en = spacy.load("en_core_web_md")
-        except:
-            print("Downloading English model...")
-            spacy.cli.download("en_core_web_md")
-            nlp_en = spacy.load("en_core_web_md")
-        
-        try:
-            nlp_es = spacy.load("es_core_news_md")
-        except:
-            print("Downloading Spanish model...")
-            spacy.cli.download("es_core_news_md")
-            nlp_es = spacy.load("es_core_news_md")
+        from fuzzywuzzy import fuzz
         
         translations_path = os.path.join(self.results_dir, "translations", "all_translations.json")
         with open(translations_path, 'r') as f:
@@ -895,178 +841,197 @@ class MTEvaluator:
         
         for video_id, data in tqdm(translations.items(), desc="Analyzing entities"):
             source_text = data['source']
-            source_doc = nlp_en(source_text)
-            source_entities = [(ent.text, ent.label_) for ent in source_doc.ents]
             
-            data['entity_analysis'] = {
-                'source_entities': source_entities,
-                'reference': {},
-                'translations': {}
-            }
+            source_entities = self._extract_entities(source_text, "en")
+            print(f"Entities found in source text for {video_id}: {source_entities}")
             
-            reference_text = data['reference']
-            reference_doc = nlp_es(reference_text)
-            reference_entities = [(ent.text, ent.label_) for ent in reference_doc.ents]
-            
-            source_entity_texts = [e[0].lower() for e in source_entities]
-            ref_entity_texts = [e[0].lower() for e in reference_entities]
-            
-            common_entities = set(source_entity_texts).intersection(set(ref_entity_texts))
-            entity_preservation = len(common_entities) / len(source_entity_texts) if source_entity_texts else 0
-            
-            data['entity_analysis']['reference'] = {
-                'entities': reference_entities,
-                'preservation_score': entity_preservation
-            }
+            if not source_entities:
+                continue
+                
+            normalized_source = [e.lower().strip() for e in source_entities]
             
             for system, translation in data['translations'].items():
-                trans_doc = nlp_es(translation)
-                trans_entities = [(ent.text, ent.label_) for ent in trans_doc.ents]
+                trans_entities = self._extract_entities(translation, "es")
+                normalized_trans = [e.lower().strip() for e in trans_entities]
                 
-                trans_entity_texts = [e[0].lower() for e in trans_entities]
-                common_with_trans = set(source_entity_texts).intersection(set(trans_entity_texts))
-                trans_preservation = len(common_with_trans) / len(source_entity_texts) if source_entity_texts else 0
+                common_entity_scores = []
+                for s_entity in normalized_source:
+                    if len(s_entity) < 3:
+                        continue
+                        
+                    best_match = 0
+                    for t_entity in normalized_trans:
+                        if len(t_entity) < 3:
+                            continue
+                            
+                        similarity = fuzz.ratio(s_entity, t_entity)
+                        if similarity > 70:
+                            best_match = max(best_match, similarity/100.0)
+                    
+                    if best_match > 0:
+                        common_entity_scores.append(best_match)
                 
-                data['entity_analysis']['translations'][system] = {
-                    'entities': trans_entities,
-                    'preservation_score': trans_preservation
-                }
+                if not normalized_source:
+                    entity_preservation = 1.0
+                else:
+                    if not common_entity_scores:
+                        entity_preservation = 0.0
+                    else:
+                        entity_preservation = sum(common_entity_scores) / len(normalized_source)
                 
                 results.append({
-                    'video_id': video_id,
-                    'system': system,
-                    'source_entity_count': len(source_entities),
-                    'translation_entity_count': len(trans_entities),
-                    'common_entity_count': len(common_with_trans),
-                    'entity_preservation': trans_preservation
+                    "video_id": video_id,
+                    "system": system,
+                    "source_entities": len(source_entities),
+                    "translated_entities": len(trans_entities),
+                    "entity_preservation": entity_preservation
                 })
         
-        results_df = pd.DataFrame(results)
-        entity_path = os.path.join(self.results_dir, "entity_analysis.csv")
-        results_df.to_csv(entity_path, index=False)
+        if not results:
+            print("Warning: No entities found in any source texts!")
+            results_df = pd.DataFrame(columns=["video_id", "system", "source_entities", 
+                                             "translated_entities", "entity_preservation"])
+        else:
+            results_df = pd.DataFrame(results)
         
-        plt.figure(figsize=(10, 6))
-        sns.barplot(x='system', y='entity_preservation', data=results_df)
-        plt.title('Named Entity Preservation by Translation System')
-        plt.xlabel('Translation System')
-        plt.ylabel('Entity Preservation Score')
-        plt.ylim(0, 1)
-        plt.savefig(os.path.join(self.results_dir, "figures", "entity_preservation.png"))
+        results_df.to_csv(os.path.join(self.results_dir, "entity_analysis.csv"), index=False)
         
-        entity_analysis_path = os.path.join(self.results_dir, "translations", "entity_analysis.json")
-        with open(entity_analysis_path, 'w') as f:
-            json.dump(translations, f, indent=2)
-        
-        self.generate_entity_html(translations)
+        self._generate_entity_preservation_plot(results_df)
         
         return results_df
 
-    def generate_entity_html(self, translations):
-        """Generate HTML report for entity analysis."""
-        html = [
-            "<!DOCTYPE html>",
-            "<html>",
-            "<head>",
-            "  <title>Entity Preservation Analysis</title>",
-            "  <style>",
-            "    body { font-family: Arial, sans-serif; }",
-            "    table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }",
-            "    th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }",
-            "    th { background-color: #f2f2f2; }",
-            "    .entity { background-color: #e6f3ff; padding: 2px 4px; border-radius: 3px; }",
-            "    .PERSON { background-color: #ffcccc; }",
-            "    .ORG { background-color: #ccffcc; }",
-            "    .LOC, .GPE { background-color: #ffffcc; }",
-            "    .DATE, .TIME { background-color: #ccccff; }",
-            "    .progress-bar { background-color: #f1f1f1; border-radius: 10px; height: 20px; }",
-            "    .progress-fill { background-color: #4CAF50; height: 20px; border-radius: 10px; }",
-            "  </style>",
-            "</head>",
-            "<body>",
-            "  <h1>Named Entity Preservation Analysis</h1>"
-        ]
+    def _extract_entities(self, text, language="en"):
+        """
+        Extract named entities from text using SpaCy with improved filtering.
         
-        for video_id, data in translations.items():
-            if 'entity_analysis' not in data:
-                continue
-            
-            html.append(f"  <h2>Video ID: {video_id}</h2>")
-            
-            html.append("  <h3>Source Text Entities</h3>")
-            html.append("  <table>")
-            html.append("    <tr><th>Entity</th><th>Type</th></tr>")
-            
-            for entity, entity_type in data['entity_analysis']['source_entities'][:20]:
-                html.append("    <tr>")
-                html.append(f"      <td>{entity}</td>")
-                html.append(f"      <td>{entity_type}</td>")
-                html.append("    </tr>")
-            
-            html.append("  </table>")
-            
-            html.append("  <h3>Entity Preservation Scores</h3>")
-            html.append("  <table>")
-            html.append("    <tr><th>System</th><th>Score</th><th>Visualization</th></tr>")
-            
-            ref_score = data['entity_analysis']['reference']['preservation_score']
-            html.append("    <tr>")
-            html.append("      <td><strong>Reference</strong></td>")
-            html.append(f"      <td>{ref_score:.2f}</td>")
-            html.append("      <td>")
-            html.append("        <div class='progress-bar'>")
-            html.append(f"          <div class='progress-fill' style='width:{ref_score*100}%'></div>")
-            html.append("        </div>")
-            html.append("      </td>")
-            html.append("    </tr>")
-            
-            for system, analysis in data['entity_analysis']['translations'].items():
-                score = analysis['preservation_score']
-                html.append("    <tr>")
-                html.append(f"      <td>{system}</td>")
-                html.append(f"      <td>{score:.2f}</td>")
-                html.append("      <td>")
-                html.append("        <div class='progress-bar'>")
-                html.append(f"          <div class='progress-fill' style='width:{score*100}%'></div>")
-                html.append("        </div>")
-                html.append("      </td>")
-                html.append("    </tr>")
-            
-            html.append("  </table>")
+        Parameters:
+        -----------
+        text : str
+            Text to extract entities from
+        language : str
+            Language code (en for English, es for Spanish)
         
-        html.append("</body>")
-        html.append("</html>")
+        Returns:
+        --------
+        list
+            List of meaningful named entities
+        """
+        if not text or len(text) < 10:
+            return []
         
-        html_path = os.path.join(self.results_dir, "entity_analysis.html")
-        with open(html_path, "w") as f:
-            f.write("\n".join(html))
+        try:
+            import spacy
+            
+            if language == "en":
+                try:
+                    nlp = spacy.load("en_core_web_md")
+                except OSError:
+                    try:
+                        nlp = spacy.load("en_core_web_sm")
+                    except OSError:
+                        print("English model not found, downloading...")
+                        spacy.cli.download("en_core_web_sm")
+                        nlp = spacy.load("en_core_web_sm")
+            elif language == "es":
+                try:
+                    nlp = spacy.load("es_core_news_md")
+                except OSError:
+                    try:
+                        nlp = spacy.load("es_core_news_sm")
+                    except OSError:
+                        print("Spanish model not found, downloading...")
+                        spacy.cli.download("es_core_news_sm")
+                        nlp = spacy.load("es_core_news_sm")
+            else:
+                print(f"Unsupported language for entity extraction: {language}")
+                return []
+                
+            doc = nlp(text)
+            
+            valid_entity_types = {"PERSON", "ORG", "GPE", "LOC", "PRODUCT", "EVENT", "WORK_OF_ART", "FAC"}
+            
+            entities = []
+            for ent in doc.ents:
+                if (ent.label_ in valid_entity_types) and len(ent.text.strip()) > 1:
+                    if ent.text.strip().lower() not in ["the", "a", "an", "this", "these", "those"]:
+                        entities.append(ent.text.strip())
+            
+            if len(entities) == 0:
+                for token in doc:
+                    if (token.pos_ == "PROPN" and token.text[0].isupper() and 
+                        len(token.text) > 1 and token.text not in entities):
+                        if token.i == 0 or doc[token.i-1].text in [".", "!", "?"]:
+                            continue
+                        entities.append(token.text)
+                        
+            if len(entities) == 0:
+                import re
+                multi_word_entities = re.findall(r'\b[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)+\b', text)
+                entities.extend(multi_word_entities)
+                
+            if len(entities) == 0:
+                time_expr = re.findall(r'\b\d+(?:[ -](?:years?|months?|weeks?|days?|hours?|minutes?|seconds?|kg|km|cm|inches|feet|pounds))\b', text, re.IGNORECASE)
+                entities.extend(time_expr)
+                
+                ordinals = re.findall(r'\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b', text, re.IGNORECASE)
+                entities.extend(ordinals)
+            
+            return entities
+            
+        except ImportError:
+            print("SpaCy not installed. Using improved regex for entity extraction.")
+            import re
+            entities = []
+            
+            text_with_markers = re.sub(r'([.!?])\s+([A-Z])', r'\1 SENTENCE_BOUNDARY \2', text)
+            sentences = text_with_markers.split('SENTENCE_BOUNDARY')
+            
+            for sentence in sentences:
+                words = sentence.split()
+                if len(words) > 1:
+                    for word in words[1:]:
+                        if re.match(r'^[A-Z][a-zA-Z]{1,}$', word) and word.lower() not in ["the", "a", "an", "this", "these", "those"]:
+                            entities.append(word)
+            
+            multi_word_entities = re.findall(r'\b[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)+\b', text)
+            entities.extend(multi_word_entities)
+            
+            time_expr = re.findall(r'\b\d+(?:[ -](?:years?|months?|weeks?|days?|hours?|minutes?|seconds?|kg|km|cm|inches|feet|pounds))\b', text, re.IGNORECASE)
+            entities.extend(time_expr)
+                
+            return entities
+            
+        except Exception as e:
+            print(f"Error extracting entities: {e}")
+            import re
+            entities = re.findall(r'\b[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)*\b', text)
+            
+            common_words = ["the", "a", "an", "this", "these", "those", "i", "my", "we", "our", "you", "your"]
+            entities = [e for e in entities if e.lower() not in common_words]
+            
+            return entities
+
+    def _generate_entity_preservation_plot(self, entity_df):
+        """Generate visualization of entity preservation scores."""
+        plt.figure(figsize=(10, 6))
         
-        print(f"Entity analysis report generated at: {html_path}")
-        return html_path
+        system_scores = entity_df.groupby('system')['entity_preservation'].mean()
+        
+        system_scores.plot(kind='bar', color='lightgreen')
+        plt.title('Average Entity Preservation by Translation System')
+        plt.ylabel('Entity Preservation Score (0-1)')
+        plt.xlabel('Translation System')
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(self.results_dir, "figures", "entity_preservation.png"))
+        plt.close()
 
     def analyze_readability(self):
         """
-        Analyze readability scores of original text and translations.
+        Improved readability analysis with better validation and normalization.
         """
-        def fernandez_huerta(text):
-            """Calculate Fernandez-Huerta readability score for Spanish text."""
-            words = len(text.split())
-            sentences = textstat.sentence_count(text)
-            
-            syllables = 0
-            for word in text.split():
-                count = 1
-                for i in range(1, len(word)):
-                    if word[i] in 'aeiouáéíóú' and word[i-1] not in 'aeiouáéíóú':
-                        count += 1
-                syllables += count
-            
-            if words == 0 or sentences == 0:
-                return 0
-            
-            p = syllables / words
-            f = words / sentences
-            
-            return 206.84 - (0.60 * p) - (1.02 * f)
+        import textstat
+        from statistics import mean
         
         translations_path = os.path.join(self.results_dir, "translations", "all_translations.json")
         with open(translations_path, 'r') as f:
@@ -1074,60 +1039,127 @@ class MTEvaluator:
         
         results = []
         
+        baseline_system = getattr(self, 'reference_system', 'deepl')
+        
         for video_id, data in tqdm(translations.items(), desc="Analyzing readability"):
             source_text = data['source']
-            source_flesch = textstat.flesch_reading_ease(source_text)
-            source_grade = textstat.text_standard(source_text, float_output=True)
             
-            data['readability_analysis'] = {
-                'source': {
-                    'flesch_reading_ease': source_flesch,
-                    'grade_level': source_grade
-                },
-                'reference': {},
-                'translations': {}
-            }
+            if len(source_text.split()) < 10:
+                print(f"Warning: Short text for {video_id}, readability may be unreliable")
             
-            reference_text = data['reference']
-            reference_score = fernandez_huerta(reference_text)
-            
-            data['readability_analysis']['reference'] = {
-                'fernandez_huerta': reference_score
-            }
+            try:
+                source_flesch = textstat.flesch_reading_ease(source_text)
+                source_flesch = max(-100, min(100, source_flesch))
+            except Exception as e:
+                print(f"Error calculating source readability for {video_id}: {e}")
+                source_flesch = 50
+                
+            baseline_readability = None
+            if baseline_system in data['translations']:
+                try:
+                    baseline_text = data['translations'][baseline_system]
+                    baseline_readability = self._calculate_fernandez_huerta(baseline_text)
+                except Exception as e:
+                    print(f"Error calculating baseline readability: {e}")
             
             for system, translation in data['translations'].items():
-                readability_score = fernandez_huerta(translation)
-                
-                data['readability_analysis']['translations'][system] = {
-                    'fernandez_huerta': readability_score
-                }
-                
-                score_difference = abs(readability_score - reference_score)
+                try:
+                    trans_fern = self._calculate_fernandez_huerta(translation)
+                    trans_fern = max(0, min(100, trans_fern))
+                    
+                    if baseline_readability is not None:
+                        score_difference = abs(trans_fern - baseline_readability)
+                    else:
+                        norm_source = (source_flesch + 100) / 2 if source_flesch < 0 else source_flesch
+                        score_difference = abs(norm_source - trans_fern)
+                    
+                    if score_difference > 100:
+                        print(f"Warning: Extreme readability difference for {video_id}, {system}: {score_difference}")
+                        score_difference = min(score_difference, 100)
+                    
+                except Exception as e:
+                    print(f"Error calculating translation readability for {video_id}, {system}: {e}")
+                    trans_fern = 50
+                    score_difference = 0
                 
                 results.append({
-                    'video_id': video_id,
-                    'system': system,
-                    'source_flesch': source_flesch,
-                    'translation_fernandez': readability_score,
-                    'score_difference': score_difference
+                    "video_id": video_id,
+                    "system": system,
+                    "source_flesch": source_flesch,
+                    "translation_fernandez": trans_fern,
+                    "score_difference": score_difference,
+                    "normalized_difference": score_difference / 100.0
                 })
         
         results_df = pd.DataFrame(results)
         readability_path = os.path.join(self.results_dir, "readability_analysis.csv")
         results_df.to_csv(readability_path, index=False)
         
-        plt.figure(figsize=(10, 6))
-        sns.barplot(x='system', y='score_difference', data=results_df)
-        plt.title('Readability Score Difference from Reference')
-        plt.xlabel('Translation System')
-        plt.ylabel('Absolute Difference')
-        plt.savefig(os.path.join(self.results_dir, "figures", "readability_difference.png"))
+        self._generate_readability_plot(results_df)
         
         readability_analysis_path = os.path.join(self.results_dir, "translations", "readability_analysis.json")
         with open(readability_analysis_path, 'w') as f:
             json.dump(translations, f, indent=2)
         
         return results_df
+
+    def _calculate_fernandez_huerta(self, text):
+        """
+        Calculate Fernandez-Huerta readability score for Spanish text.
+        """
+        import re
+        
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        sentences = re.split(r'[.!?]+', text)
+        sentence_count = sum(1 for s in sentences if s.strip())
+        
+        sentence_count = max(1, sentence_count)
+        
+        words = re.findall(r'\b\w+\b', text)
+        word_count = len(words)
+        
+        word_count = max(1, word_count)
+        
+        def count_syllables_es(word):
+            word = word.lower()
+            if not word:
+                return 0
+                
+            count = len(re.findall(r'[aeiouáéíóúü]+', word))
+            
+            count -= len(re.findall(r'[aeiouáéíóúü][aeiouáéíóúü]', word))
+            
+            return max(1, count)
+        
+        syllable_count = sum(count_syllables_es(w) for w in words)
+        
+        P = (syllable_count / word_count) * 100
+        F = (sentence_count / word_count) * 100
+        
+        score = 206.84 - (0.60 * P) - (1.02 * F)
+        
+        score = max(0, min(100, score))
+        
+        return score
+
+    def _generate_readability_plot(self, readability_df):
+        """Generate visualization of readability differences."""
+        plt.figure(figsize=(10, 6))
+        
+        system_scores = readability_df.groupby('system')['normalized_difference'].mean()
+        
+        system_scores = system_scores.sort_values()
+        
+        system_scores.plot(kind='bar', color='salmon')
+        plt.title('Average Readability Difference by Translation System')
+        plt.ylabel('Normalized Difference (0-1)')
+        plt.xlabel('Translation System')
+        plt.tight_layout()
+        plt.xticks(rotation=45)
+        
+        plt.savefig(os.path.join(self.results_dir, "figures", "readability_comparison.png"))
+        plt.close()
 
     def compute_unified_score(self, weights=None):
         """
@@ -1153,219 +1185,219 @@ class MTEvaluator:
                 'readability': 0.10,
                 'cultural_nuance': 0.15
             }
-            
-            direct_weights = {
-                'bleu': 0.15,
-                'meteor': 0.40,
-                'chrf': 0.25,
-                'rouge': 0.20
-            }
+        
+        direct_weights = {
+            'bleu': 0.15,
+            'meteor': 0.40,
+            'chrf': 0.25,
+            'rouge': 0.20
+        }
         
         systems = []
         scores = {}
+        score_components = {}
         
         try:
-            direct_path = os.path.join(self.results_dir, "mt_evaluation_results.csv")
-            if os.path.exists(direct_path):
-                df = pd.read_csv(direct_path)
-                for system in df['system'].unique():
-                    if system not in systems:
-                        systems.append(system)
+            eval_path = os.path.join(self.results_dir, "evaluation_results.csv")
+            if not os.path.exists(eval_path):
+                eval_path = os.path.join(self.results_dir, "mt_evaluation_results.csv")
+                
+            eval_df = pd.read_csv(eval_path)
+            
+            norm_path = os.path.join(self.results_dir, "normalized_evaluation_results.csv")
+            if os.path.exists(norm_path):
+                norm_df = pd.read_csv(norm_path)
+                has_normalized = True
+            else:
+                has_normalized = False
+                
+            for system in eval_df['system'].unique():
+                if system not in scores:
+                    systems.append(system)
+                    scores[system] = 0.0
+                    score_components[system] = {}
+                
+                system_df = eval_df[eval_df['system'] == system]
+                
+                if has_normalized:
+                    system_norm_df = norm_df[norm_df['system'] == system]
+                    if 'avg_norm_score' in system_norm_df.columns:
+                        direct_score = system_norm_df['avg_norm_score'].mean()
+                    else:
+                        norm_metrics = [f'norm_{m}' for m in direct_weights.keys() 
+                                       if f'norm_{m}' in system_norm_df.columns]
+                        
+                        if norm_metrics:
+                            direct_score = system_norm_df[norm_metrics].mean(axis=1).mean()
+                        else:
+                            direct_score = sum(
+                                system_df[m].mean() * w for m, w in direct_weights.items() 
+                                if m in system_df.columns
+                            )
+                else:
+                    available_metrics = [m for m in direct_weights.keys() if m in system_df.columns]
                     
-                    system_df = df[df['system'] == system]
-                    if system not in scores:
-                        scores[system] = {
-                            'components': {}
-                        }
+                    if not available_metrics:
+                        direct_score = 0.0
+                    else:
+                        total_weight = sum(direct_weights[m] for m in available_metrics)
+                        direct_score = sum(
+                            system_df[m].mean() * (direct_weights[m]/total_weight) 
+                            for m in available_metrics
+                        )
+                
+                score_components[system]['direct_translation'] = direct_score
+                scores[system] += direct_score * weights['direct_translation']
+                
+                back_path = os.path.join(self.results_dir, "back_translation_evaluation.csv")
+                if os.path.exists(back_path):
+                    back_df = pd.read_csv(back_path)
+                    system_back = back_df[back_df['system'] == system]
                     
-                    direct_score = 0
-                    for metric, weight in direct_weights.items():
-                        if metric in system_df.columns:
-                            metric_score = system_df[metric].mean()
-                            direct_score += metric_score * weight
+                    if not system_back.empty:
+                        back_metrics = ['back_bleu', 'back_meteor', 'back_chrf']
+                        available_back = [m for m in back_metrics if m in system_back.columns]
+                        
+                        if available_back:
+                            back_score = system_back[available_back].mean(axis=1).mean()
+                            score_components[system]['back_translation'] = back_score
+                            scores[system] += back_score * weights['back_translation']
+                
+                sentiment_path = os.path.join(self.results_dir, "sentiment_analysis.csv")
+                if os.path.exists(sentiment_path):
+                    sentiment_df = pd.read_csv(sentiment_path)
+                    system_sentiment = sentiment_df[sentiment_df['system'] == system]
                     
-                    scores[system]['components']['direct_translation'] = direct_score
-        except Exception as e:
-            print(f"Error processing direct translation metrics: {e}")
+                    if not system_sentiment.empty:
+                        if 'sentiment_similarity' in system_sentiment.columns:
+                            sentiment_score = system_sentiment['sentiment_similarity'].mean()
+                        else:
+                            sentiment_score = system_sentiment['sentiment_preserved'].mean()
+                            
+                        score_components[system]['sentiment'] = sentiment_score
+                        scores[system] += sentiment_score * weights['sentiment']
+                
+                entity_path = os.path.join(self.results_dir, "entity_analysis.csv")
+                if os.path.exists(entity_path):
+                    entity_df = pd.read_csv(entity_path)
+                    system_entity = entity_df[entity_df['system'] == system]
+                    
+                    if not system_entity.empty:
+                        entity_score = system_entity['entity_preservation'].mean()
+                        score_components[system]['entities'] = entity_score
+                        scores[system] += entity_score * weights['entities']
+                
+                readability_path = os.path.join(self.results_dir, "readability_analysis.csv")
+                if os.path.exists(readability_path):
+                    readability_df = pd.read_csv(readability_path)
+                    system_readability = readability_df[readability_df['system'] == system]
+                    
+                    if not system_readability.empty:
+                        if 'normalized_difference' in system_readability.columns:
+                            readability_score = 1 - system_readability['normalized_difference'].mean()
+                        else:
+                            if 'score_difference' in system_readability.columns:
+                                diffs = system_readability['score_difference'].values
+                                capped_diffs = np.clip(diffs, 0, 100)
+                                readability_score = 1 - (capped_diffs.mean() / 100)
+                            else:
+                                readability_score = 0.5
+                        
+                        score_components[system]['readability'] = readability_score
+                        scores[system] += readability_score * weights['readability']
+                
+                cultural_path = os.path.join(self.results_dir, "cultural_nuance_analysis.csv")
+                if os.path.exists(cultural_path):
+                    cultural_df = pd.read_csv(cultural_path)
+                    system_cultural = cultural_df[cultural_df['system'] == system]
+                    
+                    if not system_cultural.empty:
+                        cultural_columns = ['cultural_preservation_score', 'expression_score', 
+                                           'cultural_terms_score', 'cultural_context_score']
+                        available_cultural = [c for c in cultural_columns if c in system_cultural.columns]
+                        
+                        if available_cultural:
+                            cultural_score = system_cultural[available_cultural].mean(axis=1).mean()
+                            score_components[system]['cultural_nuance'] = cultural_score
+                            scores[system] += cultural_score * weights['cultural_nuance']
         
-        try:
-            back_path = os.path.join(self.results_dir, "back_translation_evaluation.csv")
-            if os.path.exists(back_path):
-                df = pd.read_csv(back_path)
-                for system in df['system'].unique():
-                    if system not in systems:
-                        systems.append(system)
-                    
-                    if system not in scores:
-                        scores[system] = {
-                            'components': {}
-                        }
-                    
-                    back_metrics = ['back_bleu', 'back_meteor', 'back_chrf']
-                    back_score = df[df['system'] == system][back_metrics].mean().mean()
-                    scores[system]['components']['back_translation'] = back_score
         except Exception as e:
-            print(f"Error processing back-translation metrics: {e}")
-        
-        try:
-            sentiment_path = os.path.join(self.results_dir, "sentiment_analysis.csv")
-            if os.path.exists(sentiment_path):
-                df = pd.read_csv(sentiment_path)
-                for system in df['system'].unique():
-                    if system not in systems:
-                        systems.append(system)
-                    
-                    if system not in scores:
-                        scores[system] = {
-                            'components': {}
-                        }
-                    
-                    sentiment_score = df[df['system'] == system]['sentiment_preserved'].mean()
-                    scores[system]['components']['sentiment'] = sentiment_score
-        except Exception as e:
-            print(f"Error processing sentiment metrics: {e}")
-        
-        try:
-            entity_path = os.path.join(self.results_dir, "entity_analysis.csv")
-            if os.path.exists(entity_path):
-                df = pd.read_csv(entity_path)
-                for system in df['system'].unique():
-                    if system not in systems:
-                        systems.append(system)
-                    
-                    if system not in scores:
-                        scores[system] = {
-                            'components': {}
-                        }
-                    
-                    entity_score = df[df['system'] == system]['entity_preservation'].mean()
-                    scores[system]['components']['entities'] = entity_score
-        except Exception as e:
-            print(f"Error processing entity metrics: {e}")
-        
-        try:
-            readability_path = os.path.join(self.results_dir, "readability_analysis.csv")
-            if os.path.exists(readability_path):
-                df = pd.read_csv(readability_path)
-                for system in df['system'].unique():
-                    if system not in systems:
-                        systems.append(system)
-                    
-                    if system not in scores:
-                        scores[system] = {
-                            'components': {}
-                        }
-                    
-                    max_diff = df['score_difference'].max()
-                    if max_diff > 0:
-                        readability_score = 1 - (df[df['system'] == system]['score_difference'].mean() / max_diff)
-                        scores[system]['components']['readability'] = readability_score
-        except Exception as e:
-            print(f"Error processing readability metrics: {e}")
-        
-        try:
-            cultural_path = os.path.join(self.results_dir, "cultural_nuance_analysis.csv")
-            if os.path.exists(cultural_path):
-                df = pd.read_csv(cultural_path)
-                for system in df['system'].unique():
-                    if system not in systems:
-                        systems.append(system)
-                    
-                    if system not in scores:
-                        scores[system] = {
-                            'components': {}
-                        }
-                    
-                    cultural_score = df[df['system'] == system]['cultural_preservation_score'].mean()
-                    scores[system]['components']['cultural_nuance'] = cultural_score
-        except Exception as e:
-            print(f"Error processing cultural nuance metrics: {e}")
+            print(f"Error computing unified score: {e}")
+            traceback.print_exc()
         
         results = []
         for system in systems:
-            unified_score = 0
-            components = scores[system]['components']
-            
-            for component, weight in weights.items():
-                if component in components:
-                    unified_score += components[component] * weight
-            
-            available_weights = sum(weight for comp, weight in weights.items() if comp in components)
-            if available_weights > 0 and available_weights < 1:
-                unified_score = unified_score / available_weights
-            
+            components_str = ", ".join([f"{k}: {v:.4f}" for k, v in score_components[system].items()])
             results.append({
-                'system': system,
-                'unified_score': unified_score,
-                'components': components
+                "system": system,
+                "unified_score": scores[system],
+                "components": components_str
             })
         
         results_df = pd.DataFrame(results)
         
+        results_df = results_df.sort_values("unified_score", ascending=False)
+        
         unified_path = os.path.join(self.results_dir, "unified_scores.csv")
         results_df.to_csv(unified_path, index=False)
         
-        self._create_component_radar_chart(results)
-        
-        plt.figure(figsize=(10, 6))
-        sns.barplot(x='system', y='unified_score', data=results_df)
-        plt.title('Unified Meaning Preservation Score by Translation System')
-        plt.xlabel('Translation System')
-        plt.ylabel('Score (higher is better)')
-        plt.ylim(0, 1.1)
-        plt.savefig(os.path.join(self.results_dir, "figures", "unified_score.png"))
-        plt.close()
+        self._create_unified_score_plot(results_df, score_components)
         
         return results_df
 
-    def _create_component_radar_chart(self, results):
-        """Create a radar chart showing component scores for each system."""
-        import matplotlib.pyplot as plt
-        import numpy as np
-        
-        available_components = set()
-        for result in results:
-            available_components.update(result['components'].keys())
-        
-        components = list(available_components)
-        if not components:
-            print("No components available for radar chart")
-            return
-        
-        N = len(components)
-        
-        angles = [n / float(N) * 2 * np.pi for n in range(N)]
-        angles += angles[:1]
-        
-        fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-        
-        plt.xticks(angles[:-1], components, size=12)
-        
-        ax.set_rlabel_position(0)
-        plt.yticks([0.25, 0.5, 0.75], ["0.25", "0.50", "0.75"], size=10)
-        plt.ylim(0, 1)
-        
-        for result in results:
-            system = result['system']
+    def _create_unified_score_plot(self, df, components_dict):
+        """Create visualization of unified scores with component breakdown."""
+        try:
+            plt.figure(figsize=(10, 6))
+            systems = df['system'].values
+            scores = df['unified_score'].values
             
-            component_scores = []
-            for comp in components:
-                if comp in result['components']:
-                    component_scores.append(result['components'][comp])
-                else:
-                    component_scores.append(0)
+            plt.bar(systems, scores, color='skyblue')
+            plt.title('Unified Translation Quality Score by System')
+            plt.ylabel('Score (0-1)')
+            plt.xlabel('Translation System')
+            plt.ylim(0, 1.0)
+            plt.tight_layout()
+            plt.xticks(rotation=45)
             
-            component_scores += component_scores[:1]
+            plt.savefig(os.path.join(self.results_dir, "figures", "unified_scores.png"))
+            plt.close()
             
-            ax.plot(angles, component_scores, linewidth=2, linestyle='solid', label=system)
-            ax.fill(angles, component_scores, alpha=0.1)
+            plt.figure(figsize=(12, 8))
+            
+            all_components = set()
+            for system_components in components_dict.values():
+                all_components.update(system_components.keys())
+            
+            bottom = np.zeros(len(systems))
+            
+            component_order = [
+                'direct_translation', 'back_translation', 'sentiment', 
+                'entities', 'readability', 'cultural_nuance'
+            ]
+            component_order = [c for c in component_order if c in all_components]
+            
+            for component in component_order:
+                component_values = []
+                for system in systems:
+                    value = components_dict[system].get(component, 0)
+                    component_values.append(value)
+                
+                plt.bar(systems, component_values, bottom=bottom, label=component)
+                bottom += np.array(component_values)
+            
+            plt.title('Translation Quality Score Components by System')
+            plt.ylabel('Component Contribution')
+            plt.xlabel('Translation System')
+            plt.legend(title='Components')
+            plt.tight_layout()
+            plt.xticks(rotation=45)
+            
+            plt.savefig(os.path.join(self.results_dir, "figures", "score_components.png"))
+            plt.close()
         
-        plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
-        plt.title("Component Scores by Translation System", size=15)
-        
-        radar_path = os.path.join(self.results_dir, "figures", "component_radar.png")
-        plt.savefig(radar_path, bbox_inches='tight')
-        plt.close()
+        except Exception as e:
+            print(f"Error creating unified score plot: {e}")
 
     def perform_statistical_validation(self):
         """
@@ -1671,26 +1703,239 @@ class MTEvaluator:
         return html_path
 
     def generate_comprehensive_report(self):
-        """Generate a comprehensive summary report of all analyses"""
+        """Generate a comprehensive report of all evaluation metrics."""
+        import matplotlib.pyplot as plt
+        from tabulate import tabulate
+        
+        report_dir = os.path.join(self.results_dir, "figures")
+        os.makedirs(report_dir, exist_ok=True)
+        
         try:
-            report_path = os.path.join(self.results_dir, "comprehensive_report.md")
+            eval_path = os.path.join(self.results_dir, "evaluation_results.csv")
+            back_path = os.path.join(self.results_dir, "back_translation_evaluation.csv")
+            sentiment_path = os.path.join(self.results_dir, "sentiment_analysis.csv")
+            entity_path = os.path.join(self.results_dir, "entity_analysis.csv")
+            readability_path = os.path.join(self.results_dir, "readability_analysis.csv")
+            unified_path = os.path.join(self.results_dir, "unified_scores.csv")
             
-            standard_results = pd.read_csv(os.path.join(self.results_dir, "evaluation_results.csv"))
-            back_translation_path = os.path.join(self.results_dir, "back_translation_results.csv")
-            if os.path.exists(back_translation_path):
-                back_translation_results = pd.read_csv(back_translation_path)
-            else:
-                back_translation_results = None
+            if not os.path.exists(eval_path):
+                eval_path = os.path.join(self.results_dir, "mt_evaluation_results.csv")
+            
+            data = {}
+            
+            for name, path in [('eval', eval_path), ('back', back_path), 
+                              ('sentiment', sentiment_path), ('entity', entity_path),
+                              ('readability', readability_path), ('unified', unified_path)]:
+                if os.path.exists(path):
+                    try:
+                        df = pd.read_csv(path)
+                        for col in df.columns:
+                            if col.endswith('_score') or col in ['bleu', 'meteor', 'chrf', 'rouge', 
+                                                                'sentiment_similarity', 'entity_preservation',
+                                                                'normalized_difference']:
+                                if df[col].dtype == 'object':
+                                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                        data[name] = df
+                    except Exception as e:
+                        print(f"Warning: Could not process {path}: {e}")
+            
+            report = "# Comprehensive Machine Translation Evaluation Report\n\n"
+            
+            if 'unified' in data:
+                report += "## Overall Performance\n\n"
+                unified_df = data['unified']
+                report += unified_df.to_markdown(index=False) + "\n\n"
                 
-            with open(report_path, 'w') as f:
-                f.write("# Comprehensive Machine Translation Evaluation Report\n\n")
+                plt.figure(figsize=(10, 6))
+                systems = unified_df['system'].tolist()
+                scores = unified_df['unified_score'].tolist()
                 
+                plt.bar(systems, scores)
+                plt.title('Unified Translation Quality Score by System')
+                plt.ylabel('Score (0-1)')
+                plt.xlabel('Translation System')
+                plt.ylim(0, 1)
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                
+                unified_plot_path = os.path.join(report_dir, "unified_score_plot.png")
+                plt.savefig(unified_plot_path)
+                plt.close()
+                
+                report += f"![Unified Scores]({os.path.relpath(unified_plot_path, self.results_dir)})\n\n"
+            
+            if 'eval' in data:
+                report += "## Direct Translation Metrics\n\n"
+                
+                eval_df = data['eval']
+                agg_metrics = eval_df.groupby('system')[['bleu', 'meteor', 'chrf', 'rouge']].mean().reset_index()
+                
+                report += agg_metrics.to_markdown(index=False) + "\n\n"
+                
+                metrics = ['bleu', 'meteor', 'chrf', 'rouge']
+                for metric in metrics:
+                    if metric in eval_df.columns:
+                        plt.figure(figsize=(8, 5))
+                        metric_by_system = eval_df.groupby('system')[metric].mean()
+                        
+                        plt.bar(metric_by_system.index, metric_by_system.values)
+                        plt.title(f'{metric.upper()} Score by System')
+                        plt.ylabel('Score')
+                        plt.xlabel('Translation System')
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        
+                        metric_plot_path = os.path.join(report_dir, f"{metric}_plot.png")
+                        plt.savefig(metric_plot_path)
+                        plt.close()
+                        
+                        report += f"![{metric.upper()} Scores]({os.path.relpath(metric_plot_path, self.results_dir)})\n\n"
+            
+            if 'back' in data:
+                report += "## Back-Translation Quality\n\n"
+                
+                back_df = data['back']
+                if 'similarity_score' in back_df.columns:
+                    back_agg = back_df.groupby('system')['similarity_score'].mean().reset_index()
+                    report += back_agg.to_markdown(index=False) + "\n\n"
+                    
+                    plt.figure(figsize=(8, 5))
+                    plt.bar(back_agg['system'], back_agg['similarity_score'])
+                    plt.title('Back-Translation Similarity by System')
+                    plt.ylabel('Similarity Score')
+                    plt.xlabel('Translation System')
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    
+                    back_plot_path = os.path.join(report_dir, "back_translation_plot.png")
+                    plt.savefig(back_plot_path)
+                    plt.close()
+                    
+                    report += f"![Back-Translation Scores]({os.path.relpath(back_plot_path, self.results_dir)})\n\n"
+            
+            if 'sentiment' in data:
+                report += "## Sentiment Preservation\n\n"
+                
+                sentiment_df = data['sentiment']
+                if 'sentiment_similarity' in sentiment_df.columns:
+                    sentiment_agg = sentiment_df.groupby('system')['sentiment_similarity'].mean().reset_index()
+                    report += sentiment_agg.to_markdown(index=False) + "\n\n"
+                    
+                    plt.figure(figsize=(8, 5))
+                    plt.bar(sentiment_agg['system'], sentiment_agg['sentiment_similarity'])
+                    plt.title('Sentiment Preservation by System')
+                    plt.ylabel('Similarity Score')
+                    plt.xlabel('Translation System')
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    
+                    sentiment_plot_path = os.path.join(report_dir, "sentiment_plot.png")
+                    plt.savefig(sentiment_plot_path)
+                    plt.close()
+                    
+                    report += f"![Sentiment Scores]({os.path.relpath(sentiment_plot_path, self.results_dir)})\n\n"
+            
+            if 'entity' in data:
+                report += "## Named Entity Preservation\n\n"
+                
+                entity_df = data['entity']
+                if 'entity_preservation' in entity_df.columns:
+                    entity_agg = entity_df.groupby('system')['entity_preservation'].mean().reset_index()
+                    report += entity_agg.to_markdown(index=False) + "\n\n"
+                    
+                    plt.figure(figsize=(8, 5))
+                    plt.bar(entity_agg['system'], entity_agg['entity_preservation'])
+                    plt.title('Entity Preservation by System')
+                    plt.ylabel('Preservation Score')
+                    plt.xlabel('Translation System')
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    
+                    entity_plot_path = os.path.join(report_dir, "entity_plot.png")
+                    plt.savefig(entity_plot_path)
+                    plt.close()
+                    
+                    report += f"![Entity Scores]({os.path.relpath(entity_plot_path, self.results_dir)})\n\n"
+            
+            if 'readability' in data:
+                report += "## Readability Analysis\n\n"
+                
+                readability_df = data['readability']
+                if 'normalized_difference' in readability_df.columns:
+                    read_agg = readability_df.groupby('system')['normalized_difference'].mean().reset_index()
+                    report += read_agg.to_markdown(index=False) + "\n\n"
+                    
+                    plt.figure(figsize=(8, 5))
+                    plt.bar(read_agg['system'], 1 - read_agg['normalized_difference'])
+                    plt.title('Readability Preservation by System')
+                    plt.ylabel('Preservation Score (higher is better)')
+                    plt.xlabel('Translation System')
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+                    
+                    read_plot_path = os.path.join(report_dir, "readability_plot.png")
+                    plt.savefig(read_plot_path)
+                    plt.close()
+                    
+                    report += f"![Readability Scores]({os.path.relpath(read_plot_path, self.results_dir)})\n\n"
+            
+            report += "## Conclusion\n\n"
+            
+            if 'unified' in data:
+                best_system = unified_df.loc[unified_df['unified_score'].idxmax()]['system']
+                report += f"Based on our comprehensive evaluation, **{best_system}** demonstrates the best overall performance "
+                report += "across the metrics analyzed. This system should be preferred for production use cases that require "
+                report += "high-quality machine translation.\n\n"
+            
+            report += "### Strengths and Weaknesses by System\n\n"
+            
+            if 'unified' in data:
+                for _, row in unified_df.iterrows():
+                    system = row['system']
+                    report += f"#### {system}\n\n"
+                    
+                    if 'components' in row:
+                        components_str = row['components']
+                        components_list = components_str.split(', ')
+                        
+                        strengths = []
+                        weaknesses = []
+                        
+                        for comp in components_list:
+                            if ': ' in comp:
+                                name, value_str = comp.split(': ')
+                                try:
+                                    value = float(value_str)
+                                    if value >= 0.7:
+                                        strengths.append(name)
+                                    elif value <= 0.4:
+                                        weaknesses.append(name)
+                                except ValueError:
+                                    continue
+                        
+                        if strengths:
+                            report += f"**Strengths**: {', '.join(strengths)}\n\n"
+                        if weaknesses:
+                            report += f"**Weaknesses**: {', '.join(weaknesses)}\n\n"
+                    
+                    report += "\n"
+            
+            report_path = os.path.join(self.results_dir, "comprehensive_report.md")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                sanitized_report = report.replace(',', ';')
+                f.write(sanitized_report)
+            
+            txt_path = os.path.join(self.results_dir, "comprehensive_report.txt")
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(report)
+            
+            print(f"Comprehensive report generated at: {report_path}")
             return report_path
+            
         except Exception as e:
+            print(f"Error generating comprehensive report: {e}")
             import traceback
-            print(f"Error generating comprehensive report: {str(e)}")
-            print(traceback.format_exc())
-            return None
+            traceback.print_exc()
 
     def evaluate_cultural_nuance_preservation(self):
         """
@@ -2072,11 +2317,11 @@ class MTEvaluator:
                 'cultural_nuance': 0.10
             },
             'general': {
-                'direct_translation': 0.25,
+                'direct_translation': 0.20,
                 'back_translation': 0.20,
                 'sentiment': 0.15,
                 'entities': 0.15,
-                'readability': 0.10,
+                'readability': 0.15,
                 'cultural_nuance': 0.15
             }
         }
@@ -2085,13 +2330,16 @@ class MTEvaluator:
         
         for domain in domains:
             try:
-                print(f"\nEvaluating {domain} domain texts...")
-                dataset = self.load_large_dataset(domain_filter=domain, num_samples=50)
+                print(f"\n===== Evaluating domain: {domain} =====")
                 
-                if not dataset:
-                    print(f"No data available for domain: {domain}")
+                domain_data = self.load_dataset(num_samples=50, domain_filter=domain)
+                
+                if len(domain_data) == 0:
+                    print(f"Warning: No data found for domain {domain}")
                     continue
                     
+                print(f"Loaded {len(domain_data)} samples for domain {domain}")
+                
                 domain_dir = os.path.join(self.results_dir, f"domain_{domain}")
                 os.makedirs(domain_dir, exist_ok=True)
                 os.makedirs(os.path.join(domain_dir, "figures"), exist_ok=True)
@@ -2100,14 +2348,19 @@ class MTEvaluator:
                 original_results_dir = self.results_dir
                 self.results_dir = domain_dir
                 
+                import matplotlib.pyplot as plt
+                plt.close('all')
+                
                 results = self.run_evaluation(
                     translation_systems=systems,
                     evaluation_metrics=metrics,
                     target_language="es",
                     reference_system="deepl",
                     num_samples=50,
-                    custom_dataset=dataset
+                    custom_dataset=domain_data
                 )
+                
+                plt.close('all')
                 
                 self.generate_report(results)
                 self.add_back_translation_evaluation()
@@ -2418,6 +2671,143 @@ class MTEvaluator:
         print(f"Updated comprehensive report with actual findings")
         return report_path
 
+    def load_dataset(self, num_samples=150, domain_filter=None):
+        """
+        Load data from all sources using the improved data loader.
+        """
+        from data_loader import MTDataLoader
+        loader = MTDataLoader(self.data_dir)
+        return loader.load_combined_dataset(num_samples=num_samples, domain_filter=domain_filter)
+
+    
+
+    def _create_normalized_metrics_plot(self, df):
+        """Create visualization of normalized metrics across domains."""
+        if 'avg_norm_score' not in df.columns or 'system' not in df.columns:
+            print("Warning: Required columns missing for normalized metrics plot")
+            return
+            
+        try:
+            plt.figure(figsize=(12, 8))
+            
+            domain_system_scores = df.groupby(['domain', 'system'])['avg_norm_score'].mean().reset_index()
+            
+            domains = sorted(domain_system_scores['domain'].unique())
+            systems = sorted(domain_system_scores['system'].unique())
+            
+            bar_width = 0.2
+            opacity = 0.8
+            
+            for i, system in enumerate(systems):
+                system_data = domain_system_scores[domain_system_scores['system'] == system]
+                index = np.arange(len(domains))
+                
+                values = [system_data[system_data['domain'] == d]['avg_norm_score'].values[0] 
+                         if d in system_data['domain'].values else 0 
+                         for d in domains]
+                
+                plt.bar(index + i*bar_width, values, bar_width,
+                       alpha=opacity, label=system)
+            
+            plt.xlabel('Domain')
+            plt.ylabel('Average Normalized Score')
+            plt.title('Normalized Metrics by Domain and System')
+            plt.xticks(index + bar_width, domains)
+            plt.legend()
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(self.results_dir, "figures", "normalized_metrics.png"))
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error creating normalized metrics plot: {e}")
+
+    def split_into_sentences(self, text):
+        """
+        Split text into sentences using NLTK's sentence tokenizer.
+        
+        Parameters:
+        -----------
+        text : str
+            Text to split into sentences
+        
+        Returns:
+        --------
+        list
+            List of sentences
+        """
+        try:
+            import nltk
+            nltk.download('punkt', quiet=True)
+            return nltk.sent_tokenize(text)
+        except ImportError:
+            print("NLTK not installed, using simple regex for sentence splitting")
+            import re
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            return [s.strip() for s in sentences if s.strip()]
+        except Exception as e:
+            print(f"Error splitting sentences: {e}")
+            return [text]
+
+    def analyze_sentiment(self, text, language='en'):
+        """
+        Analyze sentiment of a text.
+        
+        Parameters:
+        -----------
+        text : str
+            Text to analyze
+        language : str
+            Language code (en for English, es for Spanish)
+        
+        Returns:
+        --------
+        str
+            Sentiment label (POSITIVE, NEGATIVE, NEUTRAL)
+        """
+        try:
+            from textblob import TextBlob
+            
+            if language == 'en':
+                blob = TextBlob(text)
+                polarity = blob.sentiment.polarity
+                
+                if polarity > 0.2:
+                    return "POSITIVE"
+                elif polarity < -0.2:
+                    return "NEGATIVE"
+                else:
+                    return "NEUTRAL"
+                    
+            elif language == 'es':
+                
+                positive_words = ['bueno', 'excelente', 'feliz', 'alegre', 'genial', 
+                                 'maravilloso', 'fantástico', 'increíble', 'positivo']
+                negative_words = ['malo', 'terrible', 'triste', 'horrible', 'pésimo', 
+                                 'negativo', 'fatal', 'desastre', 'peor']
+                
+                text_lower = text.lower()
+                positive_count = sum(1 for word in positive_words if word in text_lower)
+                negative_count = sum(1 for word in negative_words if word in text_lower)
+                
+                if positive_count > negative_count:
+                    stars = min(5, 3 + positive_count - negative_count)
+                elif negative_count > positive_count:
+                    stars = max(1, 3 - (negative_count - positive_count))
+                else:
+                    stars = 3
+                    
+                return f"{stars} stars"
+            else:
+                print(f"Unsupported language for sentiment analysis: {language}")
+                return "NEUTRAL"
+        except ImportError:
+            print("TextBlob not installed, returning neutral sentiment")
+            return "NEUTRAL"
+        except Exception as e:
+            print(f"Error analyzing sentiment: {e}")
+            return "NEUTRAL"
+
 def get_youtube_videos(query, max_results=5):
     youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
     
@@ -2713,7 +3103,7 @@ def evaluate_cultural_nuance_preservation(self):
         for system, translated_text in data['translations'].items():
             if system == 'deepl':
                 continue
-                
+                    
             translated_text = translated_text.lower()
             trans_preserved = []
             
@@ -2739,27 +3129,27 @@ def evaluate_cultural_nuance_preservation(self):
                         'es_term': es_term,
                         'preserved': preserved
                     })
-            
-            if trans_preserved:
-                cultural_score = sum(1 for el in trans_preserved if el['preserved']) / len(trans_preserved)
-            else:
-                cultural_score = 0
-            
-            data['cultural_analysis']['translations'][system] = {
-                'elements': trans_preserved,
-                'score': cultural_score
-            }
-            
-            results.append({
-                'video_id': video_id,
-                'system': system,
-                'source_elements_count': len(detected_elements),
-                'preserved_elements_count': sum(1 for el in trans_preserved if el['preserved']),
-                'cultural_preservation_score': cultural_score,
-                'expression_score': self._calculate_category_score(trans_preserved, 'expressions'),
-                'cultural_terms_score': self._calculate_category_score(trans_preserved, 'cultural_terms'),
-                'cultural_context_score': self._calculate_category_score(trans_preserved, 'cultural_context')
-            })
+                
+                if trans_preserved:
+                    cultural_score = sum(1 for el in trans_preserved if el['preserved']) / len(trans_preserved)
+                else:
+                    cultural_score = 0
+                
+                data['cultural_analysis']['translations'][system] = {
+                    'elements': trans_preserved,
+                    'score': cultural_score
+                }
+                
+                results.append({
+                    'video_id': video_id,
+                    'system': system,
+                    'source_elements_count': len(detected_elements),
+                    'preserved_elements_count': sum(1 for el in trans_preserved if el['preserved']),
+                    'cultural_preservation_score': cultural_score,
+                    'expression_score': self._calculate_category_score(trans_preserved, 'expressions'),
+                    'cultural_terms_score': self._calculate_category_score(trans_preserved, 'cultural_terms'),
+                    'cultural_context_score': self._calculate_category_score(trans_preserved, 'cultural_context')
+                })
     
     cultural_analysis_path = os.path.join(self.results_dir, "translations", "cultural_analysis.json")
     with open(cultural_analysis_path, 'w') as f:
